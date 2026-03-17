@@ -188,6 +188,8 @@ Output: `dist/PixelAttic/PixelAttic.exe`
 
 ## support
 
+if you emjoy the project consider buying me a coffee :)
+
 <div align="center">
 
 [![GitHub]()](https://github.com/Gyscal/PixelAttic)
