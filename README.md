@@ -186,45 +186,13 @@ Output: `dist/PixelAttic/PixelAttic.exe`
 
 ---
 
-## 🗂️ Project Structure
-
-```
-PixelAttic/
-│
-├── main.py              # Entry point
-├── app.py               # Main window, toolbar, grid, signals
-├── panels.py            # Sidebar, detail panel, video player
-├── widgets.py           # AssetCard, VirtualGrid, TagPill
-├── search_bar.py        # Pill-based search with operators
-│
-├── database.py          # Asset dataclass, JSON library backend
-├── sqlite_db.py         # SQLite library backend
-├── config.py            # Constants, categories, file extensions
-├── settings.py          # Settings, themes, accent colors, utilities
-│
-├── dialogs.py           # Settings, import, tag editor dialogs
-├── thumbnails.py        # Thumbnail generation and caching
-├── preview.py           # Proxy video and scrub strip generation
-├── styles.py            # QSS stylesheet builder
-├── logger.py            # Logging and crash reports
-├── icons.py             # Material Icons path resolver
-│
-├── icons/               # Material Icons PNGs
-├── pixelattic.ico       # App icon
-└── pixelattic.spec      # PyInstaller build config
-```
-
----
-
----
-
-## Consider supporting the development of this tool
+## support
 
 <div align="center">
 
-[![GitHub](https://img.shields.io/badge/GitHub-ghstsoftware%2Fpixelattic-181717?style=for-the-badge&logo=github)](https://github.com/Gyscal/PixelAttic)
-[![Gumroad]()](https://4471282674150.gumroad.com/coffee)
-[![Ko-fi](https://img.shields.io/badge/Ko--fi-Support-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white)](https://ko-fi.com/guscal)
+[![GitHub]()](https://github.com/Gyscal/PixelAttic)
+[![Gumroad](https://4471282674150.gumroad.com/coffee)
+[![Ko-fi]()](https://ko-fi.com/guscal)
 
 </div>
 
