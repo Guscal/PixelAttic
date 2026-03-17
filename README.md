@@ -22,6 +22,8 @@ div align="center">
 ---
 
 ## 🧐 What is Pixel Attic?
+<img width="2559" height="1393" alt="image" src="https://github.com/user-attachments/assets/2cf35d90-2e8c-436d-9a72-13f72123531b" />
+
 
 Pixel Attic is a desktop application for organizing, browsing, and managing VFX assets. Built for artists, studios, and post-production teams, it provides a fast, visual way to catalog videos, image sequences, EXR files, textures, and other media commonly used in VFX pipelines.
 
@@ -221,7 +223,7 @@ PixelAttic/
 <div align="center">
 
 [![GitHub](https://img.shields.io/badge/GitHub-ghstsoftware%2Fpixelattic-181717?style=for-the-badge&logo=github)](https://github.com/Gyscal/PixelAttic)
-[![Gumroad](https://img.shields.io/badge/Gumroad-Purchase-FF90E8?style=for-the-badge&logo=gumroad&logoColor=white)](https://4471282674150.gumroad.com/coffee)
+[![Gumroad]()](https://4471282674150.gumroad.com/coffee)
 [![Ko-fi](https://img.shields.io/badge/Ko--fi-Support-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white)](https://ko-fi.com/guscal)
 
 </div>
