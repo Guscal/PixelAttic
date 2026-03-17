@@ -9,7 +9,7 @@ div align="center">
 [![Python](https://img.shields.io/badge/Python-3.8+-3776AB?style=flat-square&logo=python&logoColor=white)](https://python.org)
 [![PySide2](https://img.shields.io/badge/PySide2-Qt5-41CD52?style=flat-square&logo=qt&logoColor=white)](https://doc.qt.io/qtforpython/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey?style=flat-square)](/)
-[![License](https://img.shields.io/badge/License-Proprietary-orange?style=flat-square)](/)
+[![License](https://img.shields.io/badge/License-MIT-orange?style=flat-square)](/)
 
 <br>
 
