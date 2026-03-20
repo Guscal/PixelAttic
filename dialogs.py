@@ -10,7 +10,7 @@ from PySide2.QtWidgets import (
     QComboBox, QSlider, QFileDialog, QFrame, QMessageBox,
     QScrollArea
 )
-from PySide2.QtCore import Qt
+from PySide2.QtCore import Qt, QTimer, Signal
 
 from config   import APP_NAME, VERSION, LIBRARY_FILE, THUMBS_DIR
 from database import Library, Asset
@@ -140,7 +140,7 @@ class SettingsDialog(QDialog):
             btn.setChecked(name == s.accent_color)
             btn.setStyleSheet(
                 f"QPushButton::indicator {{}} "
-                f"QPushButton {{ color: rgb({r},{g},{b}); text-align:left; }}")
+                f"QPushButton {{ color: rgb({r},{g},{b}); padding-left: 4px; }}")
             btn.clicked.connect(
                 lambda checked=False, n=name: self._preview_accent(n))
             self._accent_btns[name] = btn
@@ -191,6 +191,22 @@ class SettingsDialog(QDialog):
             opts_row.addWidget(cb)
         opts_row.addStretch()
         al.addLayout(opts_row)
+
+        # Default page size on startup
+        al.addWidget(_section_label("DEFAULTS ON STARTUP"))
+        def_row = QHBoxLayout()
+        def_row.setSpacing(12)
+
+        def_row.addWidget(QLabel("Page size:"))
+        self._default_page_size = QComboBox()
+        for ps in [25, 50, 100, 200]:
+            self._default_page_size.addItem(str(ps), ps)
+        _ps_idx = self._default_page_size.findData(getattr(s, 'page_size', 50))
+        self._default_page_size.setCurrentIndex(max(0, _ps_idx))
+        self._default_page_size.setFixedWidth(70)
+        def_row.addWidget(self._default_page_size)
+        def_row.addStretch()
+        al.addLayout(def_row)
 
         # Font
         al.addWidget(_section_label("FONT"))
@@ -850,7 +866,7 @@ class SettingsDialog(QDialog):
                 inp.setReadOnly(True)
             else:
                 inp.setPlaceholderText(str(default_path))
-                inp.setToolTip(f"Leave empty to use default:\n{default_path}")
+                inp.setToolTip(f"Folder for data files. Leave empty for default:\n{default_path}")
                 setattr(self, inp_attr, inp)
                 br = QPushButton("…"); br.setFixedSize(28, 28)
                 br.setStyleSheet(_BTN_BROWSE)
@@ -872,16 +888,28 @@ class SettingsDialog(QDialog):
         # Read bootstrap for custom paths
         bp = _sm._read_bootstrap()
 
-        _row("Settings:", _sm.SETTINGS_FILE,
-             "_st_path_inp", bp.get("settings",""), readonly=False)
-        _row("Database:", LIBRARY_FILE,
-             "_db_path_inp", bp.get("library",""), readonly=False)
-        _row("Backup:",   BACKUP_FILE,
-             "_bk_path_inp", bp.get("backup",""),  readonly=False)
-        _row("Thumbs:",   THUMBS_DIR,
-             "_th_path_inp", bp.get("thumbs",""),  readonly=False)
-        _row("Proxies:",  _DEFAULT_PROXY_DIR,
-             "_pr_path_inp", bp.get("proxies",""), readonly=False)
+        # Show directories only — app appends filenames automatically
+        _default_dir = str(Path.home() / ".pixelattic")
+
+        def _bp_dir(key):
+            """Get directory from bootstrap value (strip filename if present)."""
+            v = (bp.get(key, "") or "").strip()
+            if not v: return ""
+            p = Path(v)
+            # If it looks like a file (has extension), return parent dir
+            if p.suffix: return str(p.parent)
+            return v
+
+        _row("Settings:",  _default_dir,
+             "_st_path_inp", _bp_dir("settings"), readonly=False)
+        _row("Database:",  _default_dir,
+             "_db_path_inp", _bp_dir("library"),  readonly=False)
+        _row("Backup:",    _default_dir,
+             "_bk_path_inp", _bp_dir("backup"),   readonly=False)
+        _row("Thumbnails:", _default_dir,
+             "_th_path_inp", _bp_dir("thumbs"),   readonly=False)
+        _row("Proxies:",   _DEFAULT_PROXY_DIR,
+             "_pr_path_inp", _bp_dir("proxies"),  readonly=False)
         # Keep proxy_dir_inp alias for backwards compat
         self._proxy_dir_inp = self._pr_path_inp
 
@@ -941,7 +969,7 @@ class SettingsDialog(QDialog):
         if folder:
             inp_widget.setText(folder)
     def _verify_db(self):
-        ok, msg = Library.verify_file(LIBRARY_FILE)
+        ok, msg = self._lib.verify()
         self._db_status.setStyleSheet(
             f"color: {'rgb(52,211,153)' if ok else 'rgb(248,113,113)'};")
         self._db_status.setText(f"Database: {msg}")
@@ -1026,6 +1054,10 @@ class SettingsDialog(QDialog):
         s.card_size = next(
             (n for n, b in self._size_btns.items() if b.isChecked()),
             s.card_size)
+        # Default page size on startup
+        _dps = getattr(self, '_default_page_size', None)
+        if _dps:
+            s.page_size = _dps.currentData()
         s.view_mode_default = "list" if getattr(self, "_view_list_btn", None) and self._view_list_btn.isChecked() else "grid"
         s.hidden_base_categories = list(getattr(self, "_hidden_base_cats", []) or [])
         s.ffmpeg_path        = self._ffmpeg_inp.text().strip()
@@ -1034,7 +1066,7 @@ class SettingsDialog(QDialog):
         s.custom_library_path = getattr(self, "_db_path_inp",  None) and self._db_path_inp.text().strip()  or ""
         s.custom_backup_path  = getattr(self, "_bk_path_inp",  None) and self._bk_path_inp.text().strip()  or ""
         s.custom_thumbs_path  = getattr(self, "_th_path_inp",  None) and self._th_path_inp.text().strip()  or ""
-        # Write all custom paths to bootstrap file
+        # Write all custom paths to bootstrap file (directories only)
         import settings as _sm
         _sm._write_bootstrap({
             "settings": getattr(self, "_st_path_inp", None) and self._st_path_inp.text().strip() or "",
@@ -1379,3 +1411,90 @@ class TagEditorDialog(QDialog):
             self.asset.tags.append(tag); pill.setActive(True)
         self.lib.update(self.asset)
         self._refresh_tag_list()
+
+
+class LinkVersionDialog(QDialog):
+    """Non-modal drag-and-drop dialog for linking an asset as a version.
+    User drags a card from the grid onto the drop zone.
+    Only accepts cards from the library — ignores external files."""
+
+    versionLinked = Signal(str)  # emits dropped asset_id
+
+    def __init__(self, primary_name: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Link Version — {primary_name}")
+        self.setFixedSize(300, 280)
+        self.setAcceptDrops(True)
+        self.setWindowFlags(self.windowFlags() | Qt.Tool)  # stays on top, no taskbar
+        self.dropped_asset_id = None
+
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(16, 16, 16, 12)
+        vl.setSpacing(10)
+
+        title = QLabel(f"<b>{primary_name}</b>")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet("color:rgb(200,210,230);font-size:12px;")
+        title.setWordWrap(True)
+        vl.addWidget(title)
+
+        hint = QLabel("Drag a card from the grid\nand drop it here")
+        hint.setAlignment(Qt.AlignCenter)
+        hint.setStyleSheet("color:rgb(100,116,139);font-size:11px;")
+        vl.addWidget(hint)
+
+        # Square drop zone
+        self._drop_zone = QLabel("Drop\nhere")
+        self._drop_zone.setAlignment(Qt.AlignCenter)
+        self._drop_zone.setMinimumSize(200, 140)
+        self._default_drop_style = (
+            "background:rgba(99,102,241,6);"
+            "border:2px dashed rgba(99,102,241,50);"
+            "border-radius:10px;color:rgba(99,102,241,120);"
+            "font-size:16px;font-weight:bold;")
+        self._drop_zone.setStyleSheet(self._default_drop_style)
+        vl.addWidget(self._drop_zone)
+
+        self._status = QLabel("")
+        self._status.setAlignment(Qt.AlignCenter)
+        self._status.setStyleSheet("color:rgb(100,116,139);font-size:10px;")
+        vl.addWidget(self._status)
+
+        close_btn = QPushButton("Cancel")
+        close_btn.setFixedHeight(24)
+        close_btn.clicked.connect(self.close)
+        vl.addWidget(close_btn)
+
+    def dragEnterEvent(self, event):
+        # Only accept library cards — not external file drops
+        if event.mimeData().hasFormat("application/x-pixelattic-asset-id"):
+            event.acceptProposedAction()
+            self._drop_zone.setStyleSheet(
+                "background:rgba(99,102,241,18);"
+                "border:2px solid rgba(99,102,241,120);"
+                "border-radius:10px;color:rgba(99,102,241,220);"
+                "font-size:16px;font-weight:bold;")
+            self._drop_zone.setText("Release\nto link")
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event):
+        self._drop_zone.setStyleSheet(self._default_drop_style)
+        self._drop_zone.setText("Drop\nhere")
+
+    def dropEvent(self, event):
+        mime = event.mimeData()
+        if mime.hasFormat("application/x-pixelattic-asset-id"):
+            aid = bytes(mime.data("application/x-pixelattic-asset-id")).decode("utf-8")
+            self.dropped_asset_id = aid
+            self._drop_zone.setStyleSheet(
+                "background:rgba(52,211,153,12);"
+                "border:2px solid rgba(52,211,153,80);"
+                "border-radius:10px;color:rgb(52,211,153);"
+                "font-size:16px;font-weight:bold;")
+            self._drop_zone.setText("✓\nLinked")
+            self._status.setText("Version linked successfully")
+            self._status.setStyleSheet("color:rgb(52,211,153);font-size:10px;")
+            self.versionLinked.emit(aid)
+            QTimer.singleShot(600, self.close)
+            event.acceptProposedAction()

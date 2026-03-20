@@ -275,7 +275,15 @@ def generate_strip(asset) -> Optional[Path]:
 
     strip_path = get_strip_path(asset.id)
     if strip_path.exists():
-        return strip_path
+        # Validate: a real strip with 8 frames should be >5KB
+        # Black/corrupt strips are typically <2KB
+        try:
+            if strip_path.stat().st_size > 5000:
+                return strip_path
+            else:
+                strip_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
     src = Path(asset.path)
     if not src.exists():
@@ -315,9 +323,9 @@ def _strip_from_video(src: Path, out: Path, asset) -> Optional[Path]:
         if not duration or duration < 0.1:
             return _strip_from_video_blind(src, out, asset)
 
-        # Skip first and last 5% to avoid black intros/outros
-        margin   = duration * 0.05
-        start    = margin
+        # Skip first and last 10% to avoid black intros/outros
+        margin   = duration * 0.10
+        start    = max(margin, 0.5)
         end      = duration - margin
         span     = max(end - start, 0.1)
         interval = span / N_FRAMES
@@ -326,17 +334,16 @@ def _strip_from_video(src: Path, out: Path, asset) -> Optional[Path]:
         for i in range(N_FRAMES):
             t     = start + i * interval
             fpath = THUMBS_DIR / f"_tmp_{asset.id}_{i}.png"
-            # Put -ss AFTER -i for accurate frame decode (no black keyframe issue)
-            # Trade-off: slightly slower, but correct frame every time
+            # -ss AFTER -i = accurate frame decode (avoids black keyframe issue)
             cmd = [
                 FFMPEG, "-i", str(src),
                 "-ss", f"{t:.3f}",
-                "-frames:v", "1",
+                "-frames:v", "1", "-an",
                 "-vf", f"scale={THUMB_W}:{THUMB_H}:force_original_aspect_ratio=decrease,"
-                       f"pad={THUMB_W}:{THUMB_H}:(ow-iw)/2:(oh-ih)/2:black",
+                       f"pad={THUMB_W}:{THUMB_H}:(ow-iw)/2:(oh-ih)/2:color=0x0a0a12",
                 "-y", str(fpath)
             ]
-            result = subprocess.run(cmd, capture_output=True, timeout=20)
+            result = subprocess.run(cmd, capture_output=True, timeout=30)
             if result.returncode == 0 and fpath.exists() and fpath.stat().st_size > 500:
                 frame_paths.append(fpath)
 
@@ -367,12 +374,12 @@ def _strip_from_video_blind(src: Path, out: Path, asset) -> Optional[Path]:
             cmd = [
                 FFMPEG, "-i", str(src),
                 "-ss", str(t),
-                "-frames:v", "1",
+                "-frames:v", "1", "-an",
                 "-vf", f"scale={THUMB_W}:{THUMB_H}:force_original_aspect_ratio=decrease,"
-                       f"pad={THUMB_W}:{THUMB_H}:(ow-iw)/2:(oh-ih)/2:black",
+                       f"pad={THUMB_W}:{THUMB_H}:(ow-iw)/2:(oh-ih)/2:color=0x0a0a12",
                 "-y", str(fpath)
             ]
-            r = subprocess.run(cmd, capture_output=True, timeout=20)
+            r = subprocess.run(cmd, capture_output=True, timeout=30)
             if r.returncode == 0 and fpath.exists() and fpath.stat().st_size > 500:
                 frame_paths.append(fpath)
         if not frame_paths:
@@ -419,7 +426,7 @@ def _strip_from_sequence(src: Path, out: Path, asset) -> Optional[Path]:
                 # Fallback without tonemap
                 cmd2 = [FFMPEG, "-y", "-i", str(fp),
                         "-vf", f"scale={THUMB_W}:{THUMB_H}:force_original_aspect_ratio=decrease,"
-                               f"pad={THUMB_W}:{THUMB_H}:(ow-iw)/2:(oh-ih)/2:color=0a0a12",
+                               f"pad={THUMB_W}:{THUMB_H}:(ow-iw)/2:(oh-ih)/2:color=0x0a0a12",
                         str(tmp)]
                 r2 = subprocess.run(cmd2, capture_output=True, timeout=15)
                 if r2.returncode == 0 and tmp.exists():
@@ -466,7 +473,7 @@ def _tonemap_cmd(inp: str, out: str) -> list:
         f"zscale=p=bt709,tonemap=hable,zscale=t=bt709:m=bt709:r=tv,"
         f"format=yuv420p,"
         f"scale={THUMB_W}:{THUMB_H}:force_original_aspect_ratio=decrease,"
-        f"pad={THUMB_W}:{THUMB_H}:(ow-iw)/2:(oh-ih)/2:color=0a0a12"
+        f"pad={THUMB_W}:{THUMB_H}:(ow-iw)/2:(oh-ih)/2:color=0x0a0a12"
     )
     return [FFMPEG, "-y", "-i", inp, "-vf", vf, "-vframes", "1", out]
 
@@ -478,7 +485,7 @@ def _stitch_strip(frame_paths: list, out: Path):
     try:
         from PIL import Image as _PILImage
         total_w = THUMB_W * len(frame_paths)
-        strip   = _PILImage.new("RGB", (total_w, THUMB_H), (0, 0, 0))
+        strip   = _PILImage.new("RGB", (total_w, THUMB_H), (10, 10, 18))
         for i, fp in enumerate(frame_paths):
             try:
                 frame = _PILImage.open(str(fp)).convert("RGB")

@@ -41,7 +41,16 @@ def _write_bootstrap(paths: dict):
 def get_effective_settings_file() -> Path:
     bp = _read_bootstrap()
     custom = bp.get("settings", "").strip()
-    return Path(custom) if custom and custom != str(SETTINGS_FILE) else SETTINGS_FILE
+    if custom and custom != str(SETTINGS_FILE):
+        p = Path(custom)
+        if p.suffix == ".json":
+            return p
+        elif p.suffix:
+            return p.with_name("settings.json")
+        else:
+            # It's a directory — append filename
+            return p / "settings.json"
+    return SETTINGS_FILE
 
 # ── Preset Themes ─────────────────────────────────────────────────────────────
 # Each theme defines bg, bg2, panel, border, text, text_dim, accent colors

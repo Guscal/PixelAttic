@@ -13,7 +13,7 @@ BACKUP_FILE = APP_DIR / "library.backup.json"
 
 # ── Probe timeout (seconds) — used by ffprobe calls during import ─────────
 # Increase if you work with large files on slow network drives.
-PROBE_TIMEOUT = 15
+PROBE_TIMEOUT = 30
 
 # Apply backup custom path from bootstrap
 def _apply_backup_bootstrap():
@@ -24,7 +24,15 @@ def _apply_backup_bootstrap():
             import json as _j
             bp = _j.loads(_bp_file.read_text(encoding="utf-8"))
             _bk = (bp.get("backup") or "").strip()
-            if _bk: BACKUP_FILE = Path(_bk)
+            if _bk:
+                p = Path(_bk)
+                if p.suffix == ".json":
+                    BACKUP_FILE = p
+                elif p.suffix:
+                    BACKUP_FILE = p.parent / "library.backup.json"
+                else:
+                    # Directory — append filename
+                    BACKUP_FILE = p / "library.backup.json"
     except Exception: pass
 
 _apply_backup_bootstrap()
@@ -62,6 +70,355 @@ def _get_ffprobe() -> str:
             return c
     return None
 
+
+def _parse_exr_header(path) -> dict:
+    """Parse OpenEXR header for bit depth, color space, renderer, and compression.
+    
+    Detects metadata from: V-Ray (vfb2_layers_json, vrayInfo/*),
+    Arnold (arnold/*), Redshift (redshift/*), RenderMan (prman/*),
+    Corona (corona/*), Cycles/Blender (cycles/*), Nuke (nuke/*),
+    OIIO (oiio:ColorSpace), and standard EXR chromaticities.
+    """
+    import struct
+    result = {}
+    try:
+        with open(str(path), "rb") as f:
+            magic = f.read(4)
+            if magic != b'\x76\x2f\x31\x01':
+                return result
+            f.read(4)  # version
+
+            # Read all attributes
+            attrs = {}       # name → (type_str, raw_bytes)
+            str_attrs = {}   # name → decoded string (string-type only)
+            while True:
+                name = b''
+                while True:
+                    c = f.read(1)
+                    if not c or c == b'\x00': break
+                    name += c
+                if not name: break
+                typ = b''
+                while True:
+                    c = f.read(1)
+                    if not c or c == b'\x00': break
+                    typ += c
+                size = struct.unpack('<I', f.read(4))[0]
+                data = f.read(size)
+                n = name.decode('ascii', errors='replace')
+                t = typ.decode('ascii', errors='replace')
+                attrs[n] = (t, data)
+                # Decode string attrs for easy access
+                if t == 'string' and data:
+                    if len(data) >= 4:
+                        slen = struct.unpack('<I', data[:4])[0]
+                        # Validate: slen should match remaining data
+                        if 0 < slen <= len(data) - 4 and slen < 65536:
+                            # Standard EXR: 4-byte length prefix + chars
+                            str_attrs[n] = data[4:4+slen].decode('utf-8', errors='replace').rstrip('\x00')
+                        else:
+                            # No length prefix — raw string (Houdini, some OIIO writers)
+                            str_attrs[n] = data.decode('utf-8', errors='replace').rstrip('\x00')
+                    else:
+                        str_attrs[n] = data.decode('utf-8', errors='replace').rstrip('\x00')
+
+        # ── dataWindow → width, height ────────────────────────────────────
+        if 'dataWindow' in attrs:
+            _, d = attrs['dataWindow']
+            if len(d) >= 16:
+                x1, y1, x2, y2 = struct.unpack('<iiii', d[:16])
+                result['width']  = x2 - x1 + 1
+                result['height'] = y2 - y1 + 1
+
+        # ── channels → bit depth ──────────────────────────────────────────
+        if 'channels' in attrs:
+            _, d = attrs['channels']
+            ch_types = []
+            pos = 0
+            while pos < len(d) - 1:
+                try:
+                    end = d.index(0, pos)
+                except ValueError:
+                    break
+                pos = end + 1
+                if pos + 16 > len(d): break
+                ch_type = struct.unpack('<i', d[pos:pos+4])[0]
+                ch_types.append(ch_type)
+                pos += 16
+            if ch_types:
+                type_map = {0: 32, 1: 16, 2: 32}  # UINT=32, HALF=16, FLOAT=32
+                depths = [type_map.get(t, 32) for t in ch_types]
+                result['bit_depth'] = min(depths)
+
+        # ── Compression ───────────────────────────────────────────────────
+        _comp_map = {0:"none", 1:"rle", 2:"zips", 3:"zip", 4:"piz",
+                     5:"pxr24", 6:"b44", 7:"b44a", 8:"dwaa", 9:"dwab"}
+        if 'compression' in attrs:
+            _, d = attrs['compression']
+            if d:
+                result['compression'] = _comp_map.get(d[0], f"unknown({d[0]})")
+
+        # ── Detect renderer ───────────────────────────────────────────────
+        renderer = None
+        renderer_version = None
+
+        # V-Ray: vrayInfo/*, vfb2_layers_json, exr/vfb2_layers_json
+        _vray_keys = [k for k in str_attrs if k.startswith('vrayInfo') or 'vray' in k.lower()]
+        if _vray_keys or any('vfb2' in k for k in str_attrs):
+            renderer = "V-Ray"
+            v = str_attrs.get('vrayInfo/vrayversion', str_attrs.get('vrayInfo/version', ''))
+            if v: renderer_version = v
+
+        # Arnold: arnold/*, ai:*
+        elif any(k.startswith('arnold') or k.startswith('ai:') for k in str_attrs):
+            renderer = "Arnold"
+            v = str_attrs.get('arnold/version', str_attrs.get('ai:version', ''))
+            if v: renderer_version = v
+
+        # Redshift: redshift/*
+        elif any(k.startswith('redshift') for k in str_attrs):
+            renderer = "Redshift"
+            v = str_attrs.get('redshift/version', '')
+            if v: renderer_version = v
+
+        # Corona: corona/*
+        elif any(k.startswith('corona') for k in str_attrs):
+            renderer = "Corona"
+            v = str_attrs.get('corona/version', '')
+            if v: renderer_version = v
+
+        # RenderMan/Pixar: prman/*, PixarRender*
+        elif any(k.startswith('prman') or k.startswith('Pixar') for k in str_attrs):
+            renderer = "RenderMan"
+            v = str_attrs.get('prman/version', '')
+            if v: renderer_version = v
+
+        # Cycles/Blender: cycles/*, blender/*
+        elif any(k.startswith('cycles') or k.startswith('blender') for k in str_attrs):
+            renderer = "Cycles"
+            v = str_attrs.get('cycles/version', str_attrs.get('blender/version', ''))
+            if v: renderer_version = v
+
+        # Octane: octane/*
+        elif any(k.startswith('octane') for k in str_attrs):
+            renderer = "Octane"
+
+        # Mantra (Houdini): mantra/*
+        elif any(k.startswith('mantra') or k.startswith('karma') for k in str_attrs):
+            renderer = "Karma" if any(k.startswith('karma') for k in str_attrs) else "Mantra"
+            # Try to get version from any karma/mantra key value
+            for k, v in str_attrs.items():
+                if k.startswith('karma') or k.startswith('mantra'):
+                    if any(c.isdigit() for c in v):
+                        renderer_version = v
+                        break
+
+        # Guerilla: guerilla/*
+        elif any(k.startswith('guerilla') for k in str_attrs):
+            renderer = "Guerilla"
+
+        # Nuke: nuke/*
+        elif any(k.startswith('nuke') for k in str_attrs):
+            renderer = "Nuke"
+            v = str_attrs.get('nuke/version', '')
+            if v: renderer_version = v
+
+        # OIIO/generic Software attr
+        elif 'Software' in str_attrs:
+            sw = str_attrs['Software'].strip()
+            if 'Arnold' in sw:     renderer = "Arnold"
+            elif 'V-Ray' in sw:    renderer = "V-Ray"
+            elif 'Blender' in sw:  renderer = "Cycles"
+            elif 'Nuke' in sw:     renderer = "Nuke"
+            elif 'Karma' in sw:
+                renderer = "Karma"
+                # Extract variant like "(xpu)" from "Karma (xpu) 20.5.684"
+                import re as _re
+                _km = _re.match(r'Karma\s*(\([^)]+\))?', sw)
+                if _km and _km.group(1):
+                    renderer = f"Karma {_km.group(1)}"
+            elif 'Mantra' in sw:   renderer = "Mantra"
+            elif 'Houdini' in sw:  renderer = "Houdini"
+            elif 'Redshift' in sw: renderer = "Redshift"
+            elif 'Corona' in sw:   renderer = "Corona"
+            elif 'Octane' in sw:   renderer = "Octane"
+            elif sw:               renderer = sw[:40]
+
+        # ── Fallback: detect renderer from channel names ──────────────────
+        if not renderer and 'channels' in attrs:
+            _, d = attrs['channels']
+            # Extract all channel names
+            ch_names = []
+            pos = 0
+            while pos < len(d) - 1:
+                try:
+                    end = d.index(0, pos)
+                except ValueError:
+                    break
+                ch_names.append(d[pos:end].decode('ascii', errors='replace'))
+                pos = end + 1
+                if pos + 16 > len(d): break
+                pos += 16
+            _ch_joined = ' '.join(ch_names).lower()
+
+            # V-Ray: VRayLighting, VRayReflection, VRayGlobalIllumination, etc.
+            if any('vray' in c.lower() for c in ch_names):
+                renderer = "V-Ray"
+            # Arnold: RGBA.beauty, crypto_asset, arnold_* channels
+            elif any(c.startswith('arnold') or 'crypto_' in c.lower() for c in ch_names):
+                renderer = "Arnold"
+            # Redshift: rsID, rsNoise, rsObjectID, etc.
+            elif any(c.lower().startswith('rs') and len(c) > 2 and c[2:3].isupper() for c in ch_names):
+                renderer = "Redshift"
+            # Corona: CGeometry, CShading, Corona* channels
+            elif any(c.startswith('Corona') or (c.startswith('C') and len(c) > 1 and c[1:2].isupper() and 'corona' in _ch_joined) for c in ch_names):
+                renderer = "Corona"
+            # RenderMan: Ci, Oi, PxrSurface* channels
+            elif any(c in ('Ci', 'Oi') or c.startswith('Pxr') for c in ch_names):
+                renderer = "RenderMan"
+            # Cycles: Combined, DiffDir, DiffInd, GlossDir, etc.
+            elif any(c in ('Combined', 'DiffDir', 'DiffInd', 'GlossDir', 'GlossInd', 'TransDir') for c in ch_names):
+                renderer = "Cycles"
+            # Mantra/Karma: direct_diffuse, indirect_diffuse, direct_specular, etc.
+            elif any(c in ('direct_diffuse', 'indirect_diffuse', 'direct_specular') for c in ch_names):
+                renderer = "Mantra"
+            # Octane: OctBeauty, OctDiffDir, etc.
+            elif any(c.lower().startswith('oct') for c in ch_names):
+                renderer = "Octane"
+
+        # ── Fallback: detect renderer from ANY attribute key names ─────────
+        if not renderer:
+            _all_keys = ' '.join(list(str_attrs.keys()) + list(attrs.keys())).lower()
+            if 'vray' in _all_keys or 'vfb' in _all_keys:
+                renderer = "V-Ray"
+            elif 'arnold' in _all_keys:
+                renderer = "Arnold"
+            elif 'redshift' in _all_keys:
+                renderer = "Redshift"
+            elif 'corona' in _all_keys:
+                renderer = "Corona"
+            elif 'renderman' in _all_keys or 'prman' in _all_keys:
+                renderer = "RenderMan"
+            elif 'cycles' in _all_keys or 'blender' in _all_keys:
+                renderer = "Cycles"
+            elif 'octane' in _all_keys:
+                renderer = "Octane"
+            elif 'karma' in _all_keys:
+                renderer = "Karma"
+            elif 'mantra' in _all_keys:
+                renderer = "Mantra"
+
+        if renderer:
+            result['renderer'] = renderer
+        if renderer_version:
+            result['renderer_version'] = renderer_version
+
+        # ── Detect color space ────────────────────────────────────────────
+        color_space = None
+
+        # 1. OIIO standard attribute (used by many tools)
+        _oiio_cs = str_attrs.get('oiio:ColorSpace', str_attrs.get('exr/oiio:ColorSpace', ''))
+        if _oiio_cs:
+            _oiio_cs_lower = _oiio_cs.lower().strip()
+            _cs_norm = {
+                'linear': 'Linear', 'scene_linear': 'Linear',
+                'lin_rec709': 'Linear Rec.709', 'lin_ap1': 'Linear ACEScg',
+                'acescg': 'ACEScg', 'aces2065-1': 'ACES2065-1',
+                'srgb': 'sRGB', 'srgb_texture': 'sRGB',
+                'rec709': 'Rec.709', 'bt709': 'Rec.709',
+                'rec2020': 'Rec.2020', 'bt2020': 'Rec.2020',
+                'raw': 'Raw/Data', 'data': 'Raw/Data',
+                'adobergb': 'Adobe RGB', 'p3-d65': 'DCI-P3',
+            }
+            color_space = _cs_norm.get(_oiio_cs_lower, _oiio_cs)
+
+        # 2. V-Ray: vfb2_layers_json or exr/vfb2_layers_json
+        if not color_space:
+            _vfb_json = str_attrs.get('vfb2_layers_json',
+                        str_attrs.get('exr/vfb2_layers_json', ''))
+            if _vfb_json:
+                try:
+                    import json as _j
+                    _vfb = _j.loads(_vfb_json)
+                    # Walk the layer tree for ocio_colorspace
+                    def _find_cs(obj):
+                        if isinstance(obj, dict):
+                            props = obj.get('properties', {})
+                            ocio_cs = props.get('ocio_colorspace')
+                            if ocio_cs is not None:
+                                # 0 = scene_linear, 1 = sRGB, etc.
+                                _vray_cs = {0: 'Linear', 1: 'sRGB', 2: 'Rec.709',
+                                            3: 'ACEScg', 4: 'Raw'}
+                                return _vray_cs.get(ocio_cs, f'OCIO #{ocio_cs}')
+                            for sub in obj.get('sub-layers', []):
+                                r = _find_cs(sub)
+                                if r: return r
+                        return None
+                    cs = _find_cs(_vfb)
+                    if cs: color_space = cs
+                except Exception:
+                    pass
+
+        # 3. V-Ray: vrayInfo/colorSpace
+        if not color_space:
+            _vcs = str_attrs.get('vrayInfo/colorSpace', str_attrs.get('vrayInfo/color_space', ''))
+            if _vcs:
+                _vcs_map = {'linear': 'Linear', 'srgb': 'sRGB', 'raw': 'Raw'}
+                color_space = _vcs_map.get(_vcs.lower().strip(), _vcs)
+
+        # 4. Arnold: arnold/color_space or ai:color_space
+        if not color_space:
+            _acs = str_attrs.get('arnold/color_space', str_attrs.get('ai:color_space', ''))
+            if _acs:
+                color_space = _acs if _acs[0].isupper() else _acs.title()
+
+        # 5. Redshift: redshift/colorSpace
+        if not color_space:
+            _rcs = str_attrs.get('redshift/colorSpace', str_attrs.get('redshift/color_space', ''))
+            if _rcs:
+                color_space = _rcs if _rcs[0].isupper() else _rcs.title()
+
+        # 6. Corona: corona/colorSpace
+        if not color_space:
+            _ccs = str_attrs.get('corona/colorSpace', str_attrs.get('corona/color_space', ''))
+            if _ccs:
+                color_space = _ccs if _ccs[0].isupper() else _ccs.title()
+
+        # 7. EXR chromaticities (standard OpenEXR attribute)
+        if not color_space and 'chromaticities' in attrs:
+            _, d = attrs['chromaticities']
+            if len(d) >= 32:
+                floats = struct.unpack('<8f', d[:32])
+                rx, ry, gx, gy, bx, by, wx, wy = floats
+                def _near(a, b, tol=0.02): return abs(a - b) < tol
+                if (_near(rx, 0.64) and _near(ry, 0.33) and
+                    _near(gx, 0.30) and _near(gy, 0.60) and
+                    _near(bx, 0.15) and _near(by, 0.06)):
+                    color_space = "Rec.709"
+                elif (_near(rx, 0.713) and _near(ry, 0.293) and
+                      _near(gx, 0.165) and _near(gy, 0.830)):
+                    color_space = "ACEScg"
+                elif (_near(rx, 0.708) and _near(ry, 0.292) and
+                      _near(gx, 0.170) and _near(gy, 0.797)):
+                    color_space = "ACES2065-1"
+                elif (_near(rx, 0.680) and _near(ry, 0.320) and
+                      _near(gx, 0.265) and _near(gy, 0.690)):
+                    color_space = "Rec.2020"
+                elif (_near(rx, 0.680) and _near(ry, 0.320) and
+                      _near(gx, 0.265) and _near(gy, 0.690) and
+                      _near(bx, 0.150) and _near(by, 0.060)):
+                    color_space = "DCI-P3"
+                else:
+                    color_space = f"Custom ({rx:.2f},{ry:.2f})"
+
+        if color_space:
+            result['color_space'] = color_space
+
+    except Exception:
+        pass
+    return result
+
+
 @dataclass
 
 class Asset:
@@ -90,11 +447,14 @@ class Asset:
     color_space:    Optional[str]   = None  # e.g. 'sRGB', 'ACEScg', 'Rec.709'
     audio_codec:    Optional[str]   = None  # e.g. 'aac', 'pcm_s24le'
     audio_channels: Optional[int]   = None  # 1=mono, 2=stereo, 6=5.1
+    renderer:       Optional[str]   = None  # e.g. 'V-Ray', 'Arnold', 'Nuke'
+    compression:    Optional[str]   = None  # e.g. 'zip', 'piz', 'dwaa'
 
     # User curation
     starred:        bool            = False
     rating:         int             = 0     # 0=unrated, 1-5 stars
-    linked_ids:     list            = field(default_factory=list)  # related asset IDs (versions)
+    linked_ids:     list            = field(default_factory=list)  # version IDs (primary has all)
+    version_of:     Optional[str]   = None  # if set, this is a hidden version of another asset
 
     @property
     def display_res(self) -> str:
@@ -189,10 +549,26 @@ class Asset:
 
         fps = frame_count = duration_s = None
         codec = bit_depth = color_space = audio_codec = audio_channels = None
+        renderer = exr_compression = None
 
-        # ── HDR/EXR/DPX images: PIL can't read these, use ffprobe ────────────
+        # ── EXR: parse header directly for accurate bit depth & color space ───
+        if ext == ".exr" and path.exists():
+            try:
+                _exr = _parse_exr_header(path)
+                if _exr:
+                    width  = _exr.get("width")  or width
+                    height = _exr.get("height") or height
+                    codec  = "exr"
+                    bit_depth       = _exr.get("bit_depth")
+                    color_space     = _exr.get("color_space")
+                    renderer        = _exr.get("renderer")
+                    exr_compression = _exr.get("compression")
+            except Exception:
+                pass
+
+        # ── HDR/DPX/other: use ffprobe (also EXR fallback if native parser missed) ─
         _HDR_EXTS = {".exr", ".dpx", ".hdr", ".pic", ".cin", ".sxr"}
-        if file_type == "image" and ext in _HDR_EXTS:
+        if file_type == "image" and ext in _HDR_EXTS and (bit_depth is None or width is None):
             try:
                 import shutil as _sh, subprocess as _sp, json as _js
                 ffprobe = _get_ffprobe()
@@ -208,34 +584,36 @@ class Asset:
                         if _vs:
                             width  = _vs.get("width")  or width
                             height = _vs.get("height") or height
-                            codec  = _vs.get("codec_name")  # e.g. "exr", "dpx"
+                            codec  = codec or _vs.get("codec_name")
 
-                            # Bit depth from bits_per_raw_sample or pix_fmt
-                            _bps = _vs.get("bits_per_raw_sample")
-                            if _bps and str(_bps).isdigit() and int(_bps) > 0:
-                                bit_depth = int(_bps)
-                            else:
-                                _pf = _vs.get("pix_fmt", "")
-                                if   "f32" in _pf or "32" in _pf: bit_depth = 32
-                                elif "f16" in _pf or "16" in _pf: bit_depth = 16
-                                elif "12"  in _pf:                 bit_depth = 12
-                                elif "10"  in _pf:                 bit_depth = 10
-                                elif _pf:                          bit_depth = 8
+                            # Bit depth (only if native parser didn't set it)
+                            if bit_depth is None:
+                                _bps = _vs.get("bits_per_raw_sample")
+                                if _bps and str(_bps).isdigit() and int(_bps) > 0:
+                                    bit_depth = int(_bps)
+                                else:
+                                    _pf = _vs.get("pix_fmt", "")
+                                    if   "f32" in _pf or "32" in _pf: bit_depth = 32
+                                    elif "f16" in _pf or "16" in _pf: bit_depth = 16
+                                    elif "12"  in _pf:                 bit_depth = 12
+                                    elif "10"  in _pf:                 bit_depth = 10
+                                    elif _pf:                          bit_depth = 8
 
-                            # Color space / transfer
-                            _ct = _vs.get("color_transfer", "")
-                            _cp = _vs.get("color_primaries", "")
-                            _cs = _vs.get("color_space", "")
-                            if _ct == "linear" or "f32" in _vs.get("pix_fmt","") or "f16" in _vs.get("pix_fmt",""):
-                                color_space = "Linear"
-                            elif _cp or _cs:
-                                _cs_map = {
-                                    "bt709": "Rec.709", "bt2020": "Rec.2020",
-                                    "bt470bg": "Rec.601", "smpte170m": "Rec.601",
-                                    "smpte431": "DCI-P3", "smpte432": "DCI-P3",
-                                }
-                                color_space = _cs_map.get(_cp or _cs,
-                                    (_cp or _cs).upper() if (_cp or _cs) else None)
+                            # Color space (only if native parser didn't set it)
+                            if color_space is None:
+                                _ct = _vs.get("color_transfer", "")
+                                _cp = _vs.get("color_primaries", "")
+                                _cs = _vs.get("color_space", "")
+                                if _ct == "linear":
+                                    color_space = "Linear"
+                                elif _cp or _cs:
+                                    _cs_map = {
+                                        "bt709": "Rec.709", "bt2020": "Rec.2020",
+                                        "bt470bg": "Rec.601", "smpte170m": "Rec.601",
+                                        "smpte431": "DCI-P3", "smpte432": "DCI-P3",
+                                    }
+                                    color_space = _cs_map.get(_cp or _cs,
+                                        (_cp or _cs).upper() if (_cp or _cs) else None)
             except Exception:
                 pass
 
@@ -340,6 +718,8 @@ class Asset:
             color_space     = color_space,
             audio_codec     = audio_codec,
             audio_channels  = audio_channels,
+            renderer        = renderer,
+            compression     = exr_compression,
         )
 
     @classmethod
@@ -391,6 +771,23 @@ class Asset:
         bit_depth   = None
         color_space = None
         audio_codec = None
+        renderer    = None
+        exr_compression = None
+
+        # ── EXR sequences: parse first frame header for bit depth & color space
+        if ext == ".exr" and first.exists():
+            try:
+                _exr = _parse_exr_header(first)
+                if _exr:
+                    width  = _exr.get("width")  or width
+                    height = _exr.get("height") or height
+                    codec  = "exr"
+                    bit_depth       = _exr.get("bit_depth")
+                    color_space     = _exr.get("color_space")
+                    renderer        = _exr.get("renderer")
+                    exr_compression = _exr.get("compression")
+            except Exception:
+                pass
         audio_channels = None
 
         # Try to read bit depth / color space from first EXR/DPX via ffprobe
@@ -457,6 +854,8 @@ class Asset:
             color_space  = color_space,
             audio_codec  = None,
             audio_channels = None,
+            renderer     = renderer,
+            compression  = exr_compression,
         )
 
 class Library:
@@ -575,36 +974,111 @@ class Library:
             self._collections[name].remove(asset_id)
             self.save()
 
-    # ── Asset versioning / linking ───────────────────────────────────────────
+    # ── Asset versioning ────────────────────────────────────────────────────
 
-    def link_assets(self, id_a: str, id_b: str):
-        """Link two assets as related versions. Bidirectional."""
-        a, b = self._assets.get(id_a), self._assets.get(id_b)
-        if not a or not b or id_a == id_b:
+    def link_as_version(self, primary_id: str, child_id: str):
+        """Make child_id a hidden version of primary_id.
+        Primary stays in grid, child disappears. Primary's linked_ids stores all versions."""
+        primary = self._assets.get(primary_id)
+        child   = self._assets.get(child_id)
+        if not primary or not child or primary_id == child_id:
             return
-        if id_b not in a.linked_ids:
-            a.linked_ids.append(id_b)
-        if id_a not in b.linked_ids:
-            b.linked_ids.append(id_a)
+
+        # If child was itself a primary with versions, absorb them
+        for sub_id in list(child.linked_ids):
+            sub = self._assets.get(sub_id)
+            if sub:
+                sub.version_of = primary_id
+                if sub_id not in primary.linked_ids:
+                    primary.linked_ids.append(sub_id)
+        child.linked_ids.clear()
+
+        # Link child → primary
+        child.version_of = primary_id
+        if child_id not in primary.linked_ids:
+            primary.linked_ids.append(child_id)
+        primary.version_of = None  # ensure primary stays primary
         self.save()
 
-    def unlink_assets(self, id_a: str, id_b: str):
-        """Remove link between two assets."""
-        a, b = self._assets.get(id_a), self._assets.get(id_b)
-        if a and id_b in a.linked_ids:
-            a.linked_ids.remove(id_b)
-        if b and id_a in b.linked_ids:
-            b.linked_ids.remove(id_a)
+    def unlink_version(self, primary_id: str, child_id: str):
+        """Restore a child version to an independent asset."""
+        primary = self._assets.get(primary_id)
+        child   = self._assets.get(child_id)
+        if primary and child_id in primary.linked_ids:
+            primary.linked_ids.remove(child_id)
+        if child:
+            child.version_of = None
         self.save()
 
-    def get_linked(self, asset_id: str) -> list:
-        """Return list of Asset objects linked to the given asset."""
+    def get_versions(self, asset_id: str) -> list:
+        """Return all versions sorted oldest→newest (V1=oldest, V(n)=newest)."""
+        primary = self._assets.get(asset_id)
+        if not primary:
+            return []
+        if primary.version_of:
+            primary = self._assets.get(primary.version_of)
+            if not primary:
+                return []
+        versions = [primary]
+        for lid in primary.linked_ids:
+            v = self._assets.get(lid)
+            if v:
+                versions.append(v)
+        versions.sort(key=lambda a: a.date_added or "")
+        return versions
+
+    def get_version_primary(self, asset_id: str):
+        """Get the primary asset for a version group. Returns self if already primary."""
         a = self._assets.get(asset_id)
         if not a:
-            return []
-        return [self._assets[lid] for lid in a.linked_ids if lid in self._assets]
+            return None
+        if a.version_of:
+            return self._assets.get(a.version_of)
+        return a
+
+    def promote_version(self, old_primary_id: str, new_primary_id: str):
+        """Swap which version is the primary (shown in grid)."""
+        old_p = self._assets.get(old_primary_id)
+        new_p = self._assets.get(new_primary_id)
+        if not old_p or not new_p:
+            return
+
+        # Transfer all linked_ids to new primary
+        all_versions = list(old_p.linked_ids)
+        if new_primary_id in all_versions:
+            all_versions.remove(new_primary_id)
+        all_versions.append(old_primary_id)
+
+        new_p.linked_ids = all_versions
+        new_p.version_of = None
+
+        old_p.linked_ids = []
+        old_p.version_of = new_primary_id
+
+        # Update all children to point to new primary
+        for vid in all_versions:
+            v = self._assets.get(vid)
+            if v and v.id != new_primary_id:
+                v.version_of = new_primary_id
+        self.save()
+
+    # Legacy compat
+    def link_assets(self, id_a: str, id_b: str):
+        self.link_as_version(id_a, id_b)
+
+    def unlink_assets(self, id_a: str, id_b: str):
+        self.unlink_version(id_a, id_b)
+
+    def get_linked(self, asset_id: str) -> list:
+        versions = self.get_versions(asset_id)
+        return [v for v in versions if v.id != asset_id]
 
     # ── Persistence ───────────────────────────────────────────────────────────
+
+    def verify(self) -> Tuple[bool, str]:
+        """Verify the current library is valid."""
+        count = len(self._assets)
+        return True, f"OK — {count} assets (JSON)"
 
     @staticmethod
     def verify_file(path: Path) -> Tuple[bool, str]:

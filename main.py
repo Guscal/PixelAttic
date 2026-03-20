@@ -236,7 +236,7 @@ def main():
         pp  = QPainter(pix)
         w, h = pix.width(), pix.height()
         bar_y = h - 28
-        bar_w = w - 80
+        bar_w = w - 80 
         if pct > 0:
             fill_w = int(bar_w * min(pct, 100) / 100)
             g = QLinearGradient(40, 0, 40 + bar_w, 0)

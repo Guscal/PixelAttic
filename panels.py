@@ -371,6 +371,12 @@ class DetailPanel(QWidget):
     ratingChanged    = Signal(str, int)   # (asset_id, rating 0-5)
     searchTagReq     = Signal(str)
     searchCatReq     = Signal(str)
+    editModeExited   = Signal()           # emitted when user clicks "Done"
+    switchVersionReq = Signal(str, str)   # (new_primary_id, old_primary_id)
+    linkVersionFromLib = Signal(str)      # (primary_id) — open link-from-library dialog
+    linkVersionFromFile = Signal(str)     # (primary_id) — open link-from-file dialog
+    unlinkVersionReq = Signal(str, str)   # (primary_id, child_id)
+    deleteVersionReq = Signal(str, str)   # (primary_id, child_id) — unlink + remove from lib
     prevAssetReq     = Signal()   # navigate to previous asset in list
     nextAssetReq     = Signal()   # navigate to next asset in list
     navigateToReq    = Signal(str)  # navigate to specific asset by ID
@@ -454,11 +460,54 @@ class DetailPanel(QWidget):
         self._cl.addStretch()
 
     def show_asset(self, asset: Asset, thumb_path: Optional[Path],
-                   strip_path: Optional[Path] = None):
+                   strip_path: Optional[Path] = None,
+                   skip_player: bool = False):
         self._notes_timer.stop()
         self._clear()
         self._current_asset = asset
         self._edit_mode = False
+
+        # ── Minimal mode during import — just name + thumb + hint ─────────
+        if skip_player:
+            # Name
+            name_lbl = QLabel(asset.name)
+            name_lbl.setStyleSheet(
+                "color:rgb(226,232,240);font-size:13px;font-weight:bold;")
+            name_lbl.setWordWrap(True)
+            self._cl.addWidget(name_lbl)
+
+            # Format + res
+            info = f"{asset.format or ''} · {asset.display_res}"
+            info_lbl = QLabel(info)
+            info_lbl.setStyleSheet("color:rgb(100,116,139);font-size:11px;")
+            self._cl.addWidget(info_lbl)
+            self._cl.addSpacing(6)
+
+            # Thumbnail if cached
+            if thumb_path and Path(str(thumb_path)).exists():
+                pix = QPixmap(str(thumb_path))
+                if not pix.isNull():
+                    panel_w = max(self.width() - 16, 200)
+                    scaled = pix.scaledToWidth(panel_w, Qt.FastTransformation)
+                    lbl = QLabel()
+                    lbl.setAlignment(Qt.AlignCenter)
+                    lbl.setPixmap(scaled)
+                    self._cl.addWidget(lbl)
+
+            # Hint
+            self._cl.addSpacing(8)
+            hint = QLabel("⟳  Import in progress\nFull details load when done")
+            hint.setAlignment(Qt.AlignCenter)
+            hint.setWordWrap(True)
+            hint.setStyleSheet(
+                "color:rgba(96,165,250,180);font-size:11px;"
+                "background:rgba(96,165,250,6);border-radius:4px;"
+                "padding:12px;")
+            self._cl.addWidget(hint)
+            self._cl.addStretch()
+            return
+
+        # ── Full detail mode ──────────────────────────────────────────────
 
         # ── Asset navigation ── prev / next in filtered list ───────────────
         nav = QHBoxLayout()
@@ -572,7 +621,7 @@ class DetailPanel(QWidget):
         self._cl.addSpacing(4)
 
         # ── Preview (video scrub / image thumb / player) ───────────────────
-        self._add_preview(asset, thumb_path, strip_path)
+        self._add_preview(asset, thumb_path, strip_path, skip_player)
 
         self._cl.addSpacing(4)
 
@@ -834,11 +883,15 @@ class DetailPanel(QWidget):
             _cs    = getattr(asset, 'color_space', None)
             _ac    = getattr(asset, 'audio_codec', None)
             _ach   = getattr(asset, 'audio_channels', None)
+            _rend  = getattr(asset, 'renderer', None)
+            _comp  = getattr(asset, 'compression', None)
 
             tech_items = []
             if _codec: tech_items.append(("Codec", _codec.upper()))
             if _bd:    tech_items.append(("Depth", f"{_bd}-bit"))
             if _cs:    tech_items.append(("Color", _cs))
+            if _comp:  tech_items.append(("Comp", _comp.upper()))
+            if _rend:  tech_items.append(("Engine", _rend))
             if _ac:
                 _ch_str = {1:"Mono",2:"Stereo",6:"5.1",8:"7.1"}.get(
                     _ach, f"{_ach}ch" if _ach else "")
@@ -883,82 +936,126 @@ class DetailPanel(QWidget):
                 cl.addWidget(lbl); cl.addStretch(); cl.addWidget(search_b)
                 self._cl.addWidget(cw)
 
-        # ── Linked Versions ───────────────────────────────────────────────
-        linked = self.lib.get_linked(asset.id)
-        if linked:
-            self._section("LINKED VERSIONS")
-            for la in linked:
-                lw = QWidget(); lw.setStyleSheet("background: transparent;")
-                ll = QHBoxLayout(lw); ll.setContentsMargins(0, 0, 0, 0)
-                ll.setSpacing(4)
-                lbl = _dim_lbl(f"  {la.name[:24]}{'…' if len(la.name)>24 else ''}")
-                lbl.setCursor(Qt.PointingHandCursor)
-                lbl.mousePressEvent = lambda e, lid=la.id: self._navigate_to_linked(lid)
-                ll.addWidget(lbl)
-                ll.addStretch()
-                unlink_b = QLabel("unlink")
-                unlink_b.setStyleSheet(
-                    "color:rgb(80,95,120);font-size:9px;"
-                    "background:transparent;padding:0 2px;")
-                unlink_b.setCursor(Qt.PointingHandCursor)
-                unlink_b.mousePressEvent = (
-                    lambda e, aid=asset.id, lid=la.id: self._unlink_version(aid, lid))
-                ll.addWidget(unlink_b)
-                self._cl.addWidget(lw)
+        # ── Versions ──────────────────────────────────────────────────────
+        versions = self.lib.get_versions(asset.id)
+        if len(versions) > 1:
+            self._section("VERSIONS")
+            _pid = asset.id if not asset.version_of else asset.version_of
+
+            # Dropdown selector
+            ver_row = QWidget()
+            ver_row.setStyleSheet("background:transparent;")
+            vrl = QHBoxLayout(ver_row)
+            vrl.setContentsMargins(0, 0, 0, 0)
+            vrl.setSpacing(4)
+
+            ver_combo = QComboBox()
+            ver_combo.setFixedHeight(24)
+            ver_combo.setStyleSheet(
+                f"QComboBox{{background:rgb(14,16,26);color:rgb(200,210,230);"
+                f"border:1px solid rgb(35,38,60);border-radius:3px;"
+                f"padding:2px 8px;font-size:11px;}}"
+                f"QComboBox:hover{{border-color:rgba({self._accent_rgb},80);}}"
+                f"QComboBox::drop-down{{border:none;width:18px;}}"
+                f"QComboBox QAbstractItemView{{background:rgb(12,12,22);"
+                f"color:rgb(200,210,230);selection-background-color:rgba({self._accent_rgb},40);"
+                f"border:1px solid rgb(35,38,60);}}")
+            _current_idx = 0
+            n_total = len(versions)
+            for i, va in enumerate(versions):
+                is_cur = (va.id == asset.id)
+                marker = " ◀" if is_cur else ""
+                label = f"V{i+1}  ·  {va.name[:28]}  ({va.format} {va.display_res}){marker}"
+                ver_combo.addItem(label, va.id)
+                if is_cur:
+                    _current_idx = i
+            ver_combo.setCurrentIndex(_current_idx)
+
+            def _on_version_changed(idx):
+                vid = ver_combo.itemData(idx)
+                if vid and vid != asset.id:
+                    self.switchVersionReq.emit(vid, _pid)
+            ver_combo.currentIndexChanged.connect(_on_version_changed)
+            vrl.addWidget(ver_combo, 1)
+
+            # Edit Versions button
+            edit_btn = QPushButton("Edit")
+            edit_btn.setFixedSize(40, 24)
+            edit_btn.setStyleSheet(
+                f"QPushButton{{background:rgba({self._accent_rgb},10);"
+                f"color:rgb({self._accent_rgb});border:1px solid rgba({self._accent_rgb},30);"
+                "border-radius:3px;font-size:9px;padding:0 6px;}"
+                f"QPushButton:hover{{background:rgba({self._accent_rgb},22);}}")
+            edit_btn.clicked.connect(
+                lambda checked=False, pid=_pid, vs=versions, cur=asset.id:
+                    self._show_edit_versions_menu(edit_btn, pid, vs, cur))
+            vrl.addWidget(edit_btn)
+
+            self._cl.addWidget(ver_row)
 
         self._cl.addStretch()
 
     def refresh_tags(self, asset: Asset):
-        """Refresh only tag pills — preserves edit mode. Called by app after tag changes."""
+        """Refresh only tag pills — preserves edit mode and scroll position."""
         self._current_asset = asset
+        # Save scroll position
+        scroll_bar = self._scroll.verticalScrollBar()
+        saved_scroll = scroll_bar.value()
         self._rebuild_tag_pills(asset, edit=self._edit_mode)
-        # Update preset pill active states if edit mode is open
-        if self._edit_mode and hasattr(self, '_quick_widget') and self._quick_widget.isVisible():
-            from config import PRESET_TAGS
-            q_layout = self._quick_widget.layout()
-            if q_layout and q_layout.count() > 1:
-                container = q_layout.itemAt(1).widget()
-                if container and container.layout():
-                    flow = container.layout()
-                    while flow.count():
-                        item = flow.takeAt(0)
-                        if item.widget(): item.widget().deleteLater()
-                    for tag in PRESET_TAGS[:24]:
-                        pill = TagPill(tag, active=(tag in asset.tags), search_enabled=False)
-                        pill.pressed_tag.connect(
-                            lambda t, aid=asset.id: self._toggle_tag(aid, t))
-                        flow.addWidget(pill)
+        self._refresh_quick_presets(asset)
+        # Restore scroll position
+        from PySide2.QtCore import QTimer
+        QTimer.singleShot(0, lambda: scroll_bar.setValue(saved_scroll))
+
+    def _refresh_quick_presets(self, asset: Asset):
+        """Update quick-add preset pill active states IN-PLACE (no destroy/recreate)."""
+        if not hasattr(self, '_quick_widget'):
+            return
+        q_layout = self._quick_widget.layout()
+        if not q_layout or q_layout.count() < 2:
+            return
+        container = q_layout.itemAt(1).widget()
+        if not container or not container.layout():
+            return
+        flow = container.layout()
+        for i in range(flow.count()):
+            item = flow.itemAt(i)
+            pill = item.widget() if item else None
+            if pill and hasattr(pill, 'tag_name') and hasattr(pill, 'setActive'):
+                pill.setActive(pill.tag_name in asset.tags)
 
     # ── Private ───────────────────────────────────────────────────────────────
 
     def _add_preview(self, asset: Asset, thumb_path: Optional[Path],
-                     strip_path: Optional[Path]):
+                     strip_path: Optional[Path],
+                     skip_player: bool = False):
         """
         Detail panel preview — video gets embedded player, images get thumbnail.
-        Scrub strip is for card hover only, not shown here.
+        skip_player=True: show thumbnail + hint instead of VLC (during import).
         """
         is_video = asset.file_type in ("video", "sequence")
 
-        if is_video:
+        if is_video and not skip_player:
             from preview import get_proxy_path
             proxy = get_proxy_path(asset.id)
-            using_proxy = proxy.exists()
-            play_path = str(proxy) if using_proxy else asset.path
 
-            # ── Proxy status indicator ────────────────────────────────
-            if not using_proxy:
-                hint = QLabel(
-                    "  Playing original file — proxy not yet generated. "
-                    "Playback may be slow for large files.")
-                hint.setWordWrap(True)
-                hint.setStyleSheet(
-                    "color: rgba(245,158,11,160); font-size: 10px;"
-                    " background: rgba(245,158,11,8); border-radius: 3px;"
-                    " padding: 3px 6px;")
-                self._cl.addWidget(hint)
+            if proxy.exists():
+                # Proxy ready — play it via VLC (lightweight mp4)
+                self._try_embedded_player(str(proxy), asset)
+                return
+            else:
+                # No proxy yet — show thumbnail + "generating" message
+                # NEVER load original ProRes/EXR into VLC
+                skip_player = True  # fall through to thumbnail display below
 
-            self._try_embedded_player(play_path, asset)
-            return
+        if is_video and skip_player:
+            hint = QLabel("  ⟳  Generating preview — playback available when ready")
+            hint.setWordWrap(True)
+            hint.setStyleSheet(
+                "color: rgba(96,165,250,180); font-size: 10px;"
+                " background: rgba(96,165,250,8); border-radius: 3px;"
+                " padding: 4px 8px;")
+            self._cl.addWidget(hint)
 
         has_thumb = thumb_path and Path(str(thumb_path)).exists()
         if has_thumb:
@@ -969,26 +1066,26 @@ class DetailPanel(QWidget):
             lbl = QLabel()
             lbl.setAlignment(Qt.AlignCenter)
 
-            # Try to load the original asset file for best quality + real aspect ratio
-            # For HDR/EXR the thumb_path (ffmpeg-converted PNG) is the best we have
-            src_path = Path(asset.path)
-            _LDR = {".png",".jpg",".jpeg",".tga",".bmp",".tiff",".tif",".webp"}
+            # During import: only use small cached thumbnail, never load original
             pix = None
-            if src_path.exists() and src_path.suffix.lower() in _LDR:
-                pix = QPixmap(str(src_path))
-                if pix.isNull():
-                    pix = None
+            if not skip_player:
+                # Try to load the original asset file for best quality
+                src_path = Path(asset.path)
+                _LDR = {".png",".jpg",".jpeg",".tga",".bmp",".tiff",".tif",".webp"}
+                if src_path.exists() and src_path.suffix.lower() in _LDR:
+                    pix = QPixmap(str(src_path))
+                    if pix.isNull():
+                        pix = None
             if pix is None:
                 pix = QPixmap(str(thumb_path))
 
             if not pix.isNull():
-                # Scale to fill panel width (280px), height = proportional
                 panel_w = max(self.width() - 16, 280)
-                scaled = pix.scaledToWidth(panel_w, Qt.SmoothTransformation)
-                # Cap height at 420px so very tall images don't dominate
+                _tf = Qt.FastTransformation if skip_player else Qt.SmoothTransformation
+                scaled = pix.scaledToWidth(panel_w, _tf)
                 if scaled.height() > 420:
                     scaled = pix.scaled(panel_w, 420,
-                                        Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                                        Qt.KeepAspectRatio, _tf)
                 lbl.setPixmap(scaled)
                 container.setFixedHeight(scaled.height())
             else:
@@ -1048,6 +1145,10 @@ class DetailPanel(QWidget):
                     _hud_lines.append(f"{asset.bit_depth}-bit")
                 if getattr(asset, 'color_space', None):
                     _hud_lines.append(asset.color_space)
+                if getattr(asset, 'compression', None):
+                    _hud_lines.append(asset.compression.upper())
+                if getattr(asset, 'renderer', None):
+                    _hud_lines.append(asset.renderer)
                 if asset.duration_s:
                     _hud_lines.append(f"{asset.duration_s:.1f}s")
                 if asset.file_size_mb:
@@ -1089,9 +1190,38 @@ class DetailPanel(QWidget):
                             if _os_vlc.path.isdir(_p) and _p not in _os_vlc.environ.get("PATH", ""):
                                 _os_vlc.environ["PATH"] = _p + ";" + _os_vlc.environ.get("PATH", "")
                                 break
-                        inst = _vlc.Instance("--directx-use-sysmem", "--aout=directsound")
+                        _vlc_args = [
+                            "--directx-use-sysmem",
+                            "--aout=directsound",
+                            "--no-video-title-show",
+                            "--quiet",               # suppress hw accel warnings in console
+                        ]
+                        # GPU accel: ON = let VLC pick best hw decoder (DXVA2/D3D11VA)
+                        #            OFF = force software decoding
+                        try:
+                            from settings import Settings as _SVlc
+                            if _SVlc.load().gpu_acceleration:
+                                _vlc_args.append("--avcodec-hw=any")
+                            else:
+                                _vlc_args.append("--avcodec-hw=none")
+                        except Exception:
+                            _vlc_args.append("--avcodec-hw=none")
+                        inst = _vlc.Instance(*_vlc_args)
                     else:
-                        inst = _vlc.Instance("--no-xlib")
+                        _vlc_args_linux = [
+                            "--no-xlib",
+                            "--no-video-title-show",
+                            "--quiet",
+                        ]
+                        try:
+                            from settings import Settings as _SVlc
+                            if _SVlc.load().gpu_acceleration:
+                                _vlc_args_linux.append("--avcodec-hw=any")
+                            else:
+                                _vlc_args_linux.append("--avcodec-hw=none")
+                        except Exception:
+                            _vlc_args_linux.append("--avcodec-hw=none")
+                        inst = _vlc.Instance(*_vlc_args_linux)
                     if inst is None:
                         raise RuntimeError(
                             "libvlc not found — install VLC from https://videolan.org "
@@ -1099,6 +1229,9 @@ class DetailPanel(QWidget):
                     player = inst.media_player_new()
                     container._vlc_inst   = inst
                     container._vlc_player = player
+                    # Mark content widget so cleanup knows to stop VLC
+                    if self._content:
+                        self._content._has_player = True
 
                     # Embed into Qt widget
                     import sys as _sys
@@ -1114,11 +1247,19 @@ class DetailPanel(QWidget):
                     player.set_media(media)
                     player.audio_set_volume(30)
                     # Load first frame then pause — no autoplay
+                    # Use VLC event to pause as soon as playback starts
+                    _em = player.event_manager()
+                    _pause_done = [False]
+                    def _on_playing(event):
+                        if not _pause_done[0]:
+                            _pause_done[0] = True
+                            player.set_pause(1)
+                    try:
+                        _em.event_attach(_vlc.EventType.MediaPlayerPlaying, _on_playing)
+                    except Exception:
+                        pass
                     player.play()
                     pb._set_state(False)
-                    def _pause_after_load():
-                        player.pause()
-                    QTimer.singleShot(150, _pause_after_load)
 
                     # ── Time display (frames / timecode, toggleable) ───
                     try:
@@ -1423,6 +1564,8 @@ class DetailPanel(QWidget):
             player.setVideoOutput(vw)
             player.setMedia(QMediaContent(QUrl.fromLocalFile(path)))
             container._qt_player = player
+            if self._content:
+                self._content._has_player = True
 
             ctrl, pb, pos_lbl, dur_lbl, seek, mb, pf, nf, gs, lb, vol, fs_btn, info_btn = self._ctrl_row()
             vl.addWidget(vw)
@@ -1759,6 +1902,31 @@ class DetailPanel(QWidget):
             btn.setStyleSheet(_STAR_LIT if (i + 1) <= rating else _STAR_DIM)
         self.ratingChanged.emit(asset_id, rating)
 
+    def _show_edit_versions_menu(self, btn, primary_id, versions, current_id):
+        """Popup menu to unlink/delete versions + add new ones."""
+        from PySide2.QtWidgets import QMenu
+        menu = QMenu(self)
+        for i, va in enumerate(versions):
+            is_primary = (va.id == primary_id)
+            label = f"V{i+1}  {va.name[:24]}"
+            sub = menu.addMenu(label)
+            if not is_primary:
+                sub.addAction("Unlink (keep in library)",
+                    lambda checked=False, pid=primary_id, cid=va.id:
+                        self.unlinkVersionReq.emit(pid, cid))
+                sub.addAction("Delete from library",
+                    lambda checked=False, pid=primary_id, cid=va.id:
+                        self.deleteVersionReq.emit(pid, cid))
+            else:
+                act = sub.addAction("Primary version")
+                act.setEnabled(False)
+        menu.addSeparator()
+        menu.addAction("+ Link from Library…",
+            lambda: self.linkVersionFromLib.emit(primary_id))
+        menu.addAction("+ Link from File…",
+            lambda: self.linkVersionFromFile.emit(primary_id))
+        menu.exec_(btn.mapToGlobal(btn.rect().bottomLeft()))
+
     def _navigate_to_linked(self, asset_id: str):
         self.navigateToReq.emit(asset_id)
 
@@ -1773,17 +1941,27 @@ class DetailPanel(QWidget):
 
     def _toggle_edit_mode(self, on: bool, asset: Asset):
         self._edit_mode = on
+        # Always fetch fresh asset from lib (tags may have changed during edit)
+        fresh = self.lib.get(asset.id) if asset else None
+        if not fresh:
+            fresh = asset
         if hasattr(self, '_edit_btn'):
             self._edit_btn.blockSignals(True)
             self._edit_btn.setChecked(on)
             self._edit_btn.setText("Done" if on else "Edit")
             self._edit_btn.setFixedWidth(52 if on else 46)
             self._edit_btn.blockSignals(False)
-        self._rebuild_tag_pills(asset, edit=on)
+        self._rebuild_tag_pills(fresh, edit=on)
         self._add_tag_row.setVisible(on)
         self._quick_widget.setVisible(on)
+        # Refresh quick-add preset active states
+        self._refresh_quick_presets(fresh)
+        # When exiting edit mode, signal grid to refresh
+        if not on:
+            self.editModeExited.emit()
 
     def _rebuild_tag_pills(self, asset: Asset, edit: bool = False):
+        self._tag_widget.setUpdatesEnabled(False)
         while self._tag_flow.count():
             item = self._tag_flow.takeAt(0)
             if item.widget(): item.widget().deleteLater()
@@ -1797,8 +1975,7 @@ class DetailPanel(QWidget):
                 rm.setFixedSize(16, 20)
                 rm.setStyleSheet(
                     "QPushButton{background:transparent;color:rgb(80,80,100);"
-                    "border:none;font-size:12px;padding:0;"
-                    "qproperty-alignment:'AlignCenter';}"
+                    "border:none;font-size:12px;padding:0;}"
                     "QPushButton:hover{color:rgb(248,113,113);}")
                 rm.clicked.connect(
                     lambda checked=False, tag=t, aid=asset.id:
@@ -1810,6 +1987,7 @@ class DetailPanel(QWidget):
                 pill.pressed_tag.connect(
                     lambda tag, _=None: self.searchTagReq.emit(tag))
                 self._tag_flow.addWidget(pill)
+        self._tag_widget.setUpdatesEnabled(True)
 
     def _do_add_tags(self, asset_id: str, text: str):
         from config import normalize_tag
@@ -1827,38 +2005,57 @@ class DetailPanel(QWidget):
             self.tagAdded.emit(asset_id, tag)
 
     def _stop_active_player(self):
-        """Stop and release any active VLC or Qt media player."""
+        """Stop and release any active VLC or Qt media player — non-blocking."""
         try:
-            if self._content is not None:
-                # VLC player
-                vlc_p = getattr(self._content, '_vlc_player', None)
-                if vlc_p:
-                    try: vlc_p.stop()
-                    except Exception: pass
-                    try: vlc_p.release()
-                    except Exception: pass
-                    self._content._vlc_player = None
-                # Qt multimedia player
-                qt_p = getattr(self._content, '_qt_player', None)
-                if qt_p:
-                    try: qt_p.stop()
-                    except Exception: pass
-                    self._content._qt_player = None
-                # Walk children too (player may be on a child widget)
-                for child in self._content.findChildren(object.__class__):
-                    for attr in ('_vlc_player', '_qt_player'):
-                        p = getattr(child, attr, None)
-                        if p:
-                            try: p.stop()
-                            except Exception: pass
-                            try: p.release()
-                            except Exception: pass
+            if self._content is None:
+                return
+            # Collect all player refs and detach from widgets INSTANTLY
+            _players = []
+            _instances = []
+            vlc_p = getattr(self._content, '_vlc_player', None)
+            if vlc_p:
+                _players.append(vlc_p)
+                self._content._vlc_player = None
+            qt_p = getattr(self._content, '_qt_player', None)
+            if qt_p:
+                try: qt_p.stop()
+                except: pass
+                self._content._qt_player = None
+            for child in self._content.findChildren(QWidget):
+                p = getattr(child, '_vlc_player', None)
+                if p:
+                    _players.append(p)
+                    child._vlc_player = None
+                inst = getattr(child, '_vlc_inst', None)
+                if inst:
+                    _instances.append(inst)
+                    child._vlc_inst = None
+                qp = getattr(child, '_qt_player', None)
+                if qp:
+                    try: qp.stop()
+                    except: pass
+                    child._qt_player = None
+            # Defer stop + release to next event loop tick — never blocks UI
+            if _players or _instances:
+                def _deferred():
+                    for p in _players:
+                        try: p.stop()
+                        except: pass
+                    for p in _players:
+                        try: p.release()
+                        except: pass
+                    for i in _instances:
+                        try: i.release()
+                        except: pass
+                QTimer.singleShot(0, _deferred)
         except Exception:
             pass
 
     def _rebuild_content_widget(self):
-        self._stop_active_player()
         if self._content is not None:
+            # Only do expensive player cleanup if we know a player was created
+            if getattr(self._content, '_has_player', False):
+                self._stop_active_player()
             self._scroll.takeWidget()
             self._content.deleteLater()
         self._content = QWidget()

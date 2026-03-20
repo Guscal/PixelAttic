@@ -183,7 +183,6 @@ def build_stylesheet(theme_name: str, accent_name: str) -> str:
         background: transparent;
         border: none;
         border-left: 2px solid transparent;
-        text-align: left;
         padding: 5px 10px;
         color: {text_med};
         font-size: 12px;
@@ -209,7 +208,6 @@ def build_stylesheet(theme_name: str, accent_name: str) -> str:
         border-radius: 4px;
         padding: 2px 8px;
         font-weight: bold;
-        text-align: center;
     }}
     #sidebar QPushButton#btn_accent:hover {{ background: {rgba(*a, 210)}; }}
     #sidebar QPushButton#btn_edit {{
@@ -218,7 +216,6 @@ def build_stylesheet(theme_name: str, accent_name: str) -> str:
         border: 1px solid {border_lt};
         border-radius: 3px;
         padding: 2px 6px;
-        text-align: center;
         font-size: 11px;
         min-height: 20px;
     }}

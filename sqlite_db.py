@@ -23,7 +23,47 @@ from typing import Optional
 from database import Asset, LIBRARY_FILE, BACKUP_FILE
 
 DB_DIR  = Path.home() / ".pixelattic"
-DB_FILE = DB_DIR / "library.db"
+
+def _get_db_path() -> Path:
+    """Get SQLite DB path: custom directory from bootstrap/settings + library.db."""
+    # 1. Check bootstrap paths.json
+    try:
+        _bp = Path.home() / ".pixelattic" / "paths.json"
+        if _bp.exists():
+            import json as _j
+            bp = _j.loads(_bp.read_text(encoding="utf-8"))
+            _lib = (bp.get("library") or "").strip()
+            if _lib:
+                p = Path(_lib)
+                if p.suffix == ".db":
+                    return p
+                elif p.suffix == ".json":
+                    return p.with_suffix(".db")
+                else:
+                    # It's a directory — append filename
+                    return p / "library.db"
+    except Exception:
+        pass
+    # 2. Check settings custom_library_path
+    try:
+        _sf = Path.home() / ".pixelattic" / "settings.json"
+        if _sf.exists():
+            import json as _j
+            data = _j.loads(_sf.read_text(encoding="utf-8"))
+            _clp = (data.get("custom_library_path") or "").strip()
+            if _clp:
+                p = Path(_clp)
+                if p.suffix == ".db":
+                    return p
+                elif p.suffix == ".json":
+                    return p.with_suffix(".db")
+                else:
+                    return p / "library.db"
+    except Exception:
+        pass
+    return DB_DIR / "library.db"
+
+DB_FILE = _get_db_path()
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS assets (
@@ -50,6 +90,9 @@ CREATE TABLE IF NOT EXISTS assets (
     color_space   TEXT,
     audio_codec   TEXT,
     audio_channels INTEGER,
+    renderer      TEXT,
+    compression   TEXT,
+    version_of    TEXT,
     starred       INTEGER NOT NULL DEFAULT 0,
     rating        INTEGER NOT NULL DEFAULT 0,
     linked_ids    TEXT NOT NULL DEFAULT '[]'
@@ -93,6 +136,13 @@ class SQLiteLibrary:
             self._conn.executescript(_SCHEMA)
             self._conn.commit()
             print(f"[SQLiteLib] Recreated DB (old schema was corrupted)")
+        # Migrate: add columns that may not exist in older databases
+        for col, typ in [("renderer", "TEXT"), ("compression", "TEXT"), ("version_of", "TEXT")]:
+            try:
+                self._conn.execute(f"ALTER TABLE assets ADD COLUMN {col} {typ}")
+                self._conn.commit()
+            except sqlite3.OperationalError:
+                pass  # column already exists
         self._batch_mode = False
         print(f"[SQLiteLib] Opened {db_path}")
 
@@ -245,31 +295,91 @@ class SQLiteLibrary:
 
     # ── Asset linking ────────────────────────────────────────────────────────
 
-    def link_assets(self, id_a: str, id_b: str):
-        a, b = self.get(id_a), self.get(id_b)
-        if not a or not b or id_a == id_b:
+    def link_as_version(self, primary_id: str, child_id: str):
+        primary = self.get(primary_id)
+        child = self.get(child_id)
+        if not primary or not child or primary_id == child_id:
             return
-        if id_b not in a.linked_ids:
-            a.linked_ids.append(id_b)
-            self.update(a)
-        if id_a not in b.linked_ids:
-            b.linked_ids.append(id_a)
-            self.update(b)
+        for sub_id in list(child.linked_ids):
+            sub = self.get(sub_id)
+            if sub:
+                sub.version_of = primary_id
+                self.update(sub)
+                if sub_id not in primary.linked_ids:
+                    primary.linked_ids.append(sub_id)
+        child.linked_ids = []
+        child.version_of = primary_id
+        if child_id not in primary.linked_ids:
+            primary.linked_ids.append(child_id)
+        primary.version_of = None
+        self.update(primary)
+        self.update(child)
 
-    def unlink_assets(self, id_a: str, id_b: str):
-        a, b = self.get(id_a), self.get(id_b)
-        if a and id_b in a.linked_ids:
-            a.linked_ids.remove(id_b)
-            self.update(a)
-        if b and id_a in b.linked_ids:
-            b.linked_ids.remove(id_a)
-            self.update(b)
+    def unlink_version(self, primary_id: str, child_id: str):
+        primary = self.get(primary_id)
+        child = self.get(child_id)
+        if primary and child_id in primary.linked_ids:
+            primary.linked_ids.remove(child_id)
+            self.update(primary)
+        if child:
+            child.version_of = None
+            self.update(child)
 
-    def get_linked(self, asset_id: str) -> list:
+    def get_versions(self, asset_id: str) -> list:
         a = self.get(asset_id)
         if not a:
             return []
-        return [self.get(lid) for lid in a.linked_ids if self.get(lid)]
+        if a.version_of:
+            a = self.get(a.version_of)
+            if not a:
+                return []
+        versions = [a]
+        for lid in a.linked_ids:
+            v = self.get(lid)
+            if v:
+                versions.append(v)
+        versions.sort(key=lambda x: x.date_added or "")
+        return versions
+
+    def get_version_primary(self, asset_id: str):
+        a = self.get(asset_id)
+        if not a:
+            return None
+        if a.version_of:
+            return self.get(a.version_of)
+        return a
+
+    def promote_version(self, old_primary_id: str, new_primary_id: str):
+        old_p = self.get(old_primary_id)
+        new_p = self.get(new_primary_id)
+        if not old_p or not new_p:
+            return
+        all_versions = list(old_p.linked_ids)
+        if new_primary_id in all_versions:
+            all_versions.remove(new_primary_id)
+        all_versions.append(old_primary_id)
+        new_p.linked_ids = all_versions
+        new_p.version_of = None
+        old_p.linked_ids = []
+        old_p.version_of = new_primary_id
+        self.update(new_p)
+        self.update(old_p)
+        for vid in all_versions:
+            v = self.get(vid)
+            if v and v.id != new_primary_id:
+                v.version_of = new_primary_id
+                self.update(v)
+
+    # Legacy compat
+    def link_assets(self, id_a: str, id_b: str):
+        self.link_as_version(id_a, id_b)
+
+    def unlink_assets(self, id_a: str, id_b: str):
+        self.unlink_version(id_a, id_b)
+
+    def get_linked(self, asset_id: str) -> list:
+        versions = self.get_versions(asset_id)
+        return [v for v in versions if v.id != asset_id]
 
     # ── Duplicate detection ──────────────────────────────────────────────────
 
@@ -417,17 +527,41 @@ class SQLiteLibrary:
         except Exception:
             pass
 
-    @staticmethod
-    def verify_file(path: Path) -> tuple:
-        """Check if a SQLite DB is valid."""
+    def verify(self) -> tuple:
+        """Check if the SQLite DB is valid and return asset count."""
         try:
-            conn = sqlite3.connect(str(path))
-            conn.execute("SELECT COUNT(*) FROM assets")
-            conn.close()
-            return True, "OK"
+            row = self._conn.execute("SELECT COUNT(*) FROM assets").fetchone()
+            count = row[0] if row else 0
+            return True, f"OK — {count} assets (SQLite)"
         except Exception as e:
             return False, str(e)
 
     @staticmethod
-    def restore_from_backup() -> tuple:
-        return False, "SQLite uses WAL — automatic recovery"
+    def verify_file(path: Path) -> tuple:
+        """Check if a SQLite DB file is valid."""
+        try:
+            conn = sqlite3.connect(str(path))
+            row = conn.execute("SELECT COUNT(*) FROM assets").fetchone()
+            count = row[0] if row else 0
+            conn.close()
+            return True, f"OK — {count} assets"
+        except Exception as e:
+            return False, str(e)
+
+    def restore_from_backup(self) -> tuple:
+        """Restore from .db.bak backup file."""
+        import shutil
+        bak = self._db_path.with_suffix(".db.bak")
+        if not bak.exists():
+            return False, f"No backup found at {bak.name}"
+        try:
+            self._conn.close()
+            shutil.copy2(bak, self._db_path)
+            self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            row = self._conn.execute("SELECT COUNT(*) FROM assets").fetchone()
+            count = row[0] if row else 0
+            return True, f"Restored {count} assets from {bak.name}"
+        except Exception as e:
+            return False, str(e)

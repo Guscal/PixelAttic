@@ -282,7 +282,7 @@ class AssetCard(QFrame):
             name_lbl.setToolTip(asset.name)
             layout.addWidget(name_lbl)
 
-        # ── Format + resolution ───────────────────────────────────────────
+        # ── Format + resolution + version badge ────────────────────────────
         if show_res:
             res_w = QWidget()
             res_w.setFixedHeight(14)
@@ -297,6 +297,16 @@ class AssetCard(QFrame):
             res_lbl.setStyleSheet("color: rgb(71,85,105); font-size: 10px;")
             row.addWidget(fmt_lbl)
             row.addWidget(res_lbl)
+            # Version badge
+            n_versions = len(getattr(asset, 'linked_ids', []))
+            if n_versions > 0:
+                ver_lbl = QLabel(f"V{n_versions + 1}")
+                ver_lbl.setStyleSheet(
+                    "color: rgb(129,140,248); font-size: 9px; font-weight: bold;"
+                    "background: rgba(129,140,248,15); border-radius: 2px;"
+                    "padding: 0 3px;")
+                ver_lbl.setToolTip(f"{n_versions + 1} versions")
+                row.addWidget(ver_lbl)
             row.addStretch()
             layout.addWidget(res_w)
 
@@ -601,6 +611,8 @@ class AssetCard(QFrame):
             mime = QMimeData()
             mime.setUrls([QUrl.fromLocalFile(str(self._asset.path))])
             mime.setText(str(self._asset.path))
+            mime.setData("application/x-pixelattic-asset-id",
+                         self.asset_id.encode("utf-8"))
             drag.setMimeData(mime)
             if self._thumb_pix:
                 drag.setPixmap(self._thumb_pix.scaled(
@@ -722,7 +734,16 @@ class VirtualGrid(QWidget):
             return
         if getattr(self, '_frozen', False):
             return
+        # Use viewport width for centering (more reliable than self.width on startup)
+        vp_w = self._scroll.viewport().width()
         vp_h = self._scroll.viewport().height()
+        if vp_w < 10 or vp_h < 10:
+            # Widget not laid out yet — defer once
+            if not getattr(self, '_deferred_pending', False):
+                self._deferred_pending = True
+                from PySide2.QtCore import QTimer
+                QTimer.singleShot(50, self._deferred_scroll)
+            return
         scroll_y = self._scroll.verticalScrollBar().value()
         first_row = max(0, scroll_y // self._row_h - self._buffer_rows)
         last_row = min(
@@ -739,7 +760,7 @@ class VirtualGrid(QWidget):
 
         # Centering offset
         total_grid_w = self._cols * self._card_w + (self._cols - 1) * self._gap
-        x_offset = max(0, (self.width() - total_grid_w) // 2)
+        x_offset = max(0, (vp_w - total_grid_w) // 2)
 
         # Add newly visible rows
         for r in range(first_row, last_row + 1):
@@ -751,7 +772,10 @@ class VirtualGrid(QWidget):
                 continue
             cards = []
             for i, asset in enumerate(self._assets[start:end]):
-                card = self._card_factory(asset)
+                try:
+                    card = self._card_factory(asset)
+                except Exception:
+                    continue  # skip broken asset, don't crash grid
                 card.setParent(self)
                 x = x_offset + i * (self._card_w + self._gap)
                 y = r * self._row_h + self._gap // 2
@@ -760,13 +784,18 @@ class VirtualGrid(QWidget):
                 cards.append(card)
             self._visible_cards[r] = cards
 
+    def _deferred_scroll(self):
+        self._deferred_pending = False
+        self._on_scroll()
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if getattr(self, '_frozen', False):
             return
         if self._visible_cards:
+            vp_w = self._scroll.viewport().width()
             total_grid_w = self._cols * self._card_w + (self._cols - 1) * self._gap
-            x_offset = max(0, (self.width() - total_grid_w) // 2)
+            x_offset = max(0, (vp_w - total_grid_w) // 2)
             for r, cards in self._visible_cards.items():
                 for i, card in enumerate(cards):
                     x = x_offset + i * (self._card_w + self._gap)

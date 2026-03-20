@@ -6,7 +6,7 @@ from pathlib import Path
 
 # ── App meta ──────────────────────────────────────────────────────────────────
 APP_NAME    = "PIXEL ATTIC"
-VERSION     = "1.0.0"
+VERSION     = "1.1.2"
 APP_DIR     = Path.home() / ".pixelattic"
 LIBRARY_FILE= APP_DIR / "library.json"
 THUMBS_DIR  = APP_DIR / "thumbs"
@@ -22,8 +22,22 @@ def _apply_bootstrap_paths():
             bp = _j.loads(_bp_file.read_text(encoding="utf-8"))
             _lib  = (bp.get("library")  or "").strip()
             _th   = (bp.get("thumbs")   or "").strip()
-            if _lib:  LIBRARY_FILE = Path(_lib)
-            if _th:   THUMBS_DIR   = Path(_th)
+            if _lib:
+                p = Path(_lib)
+                # If it's a directory (no extension or is a dir), append filename
+                if p.suffix == "":
+                    LIBRARY_FILE = p / "library.json"
+                elif p.suffix == ".json":
+                    LIBRARY_FILE = p
+                else:
+                    LIBRARY_FILE = p / "library.json"
+            if _th:
+                p = Path(_th)
+                # Thumbs is always a directory
+                if p.suffix:
+                    THUMBS_DIR = p.parent  # strip accidental filename
+                else:
+                    THUMBS_DIR = p
     except Exception as _e:
         print(f"[Config] bootstrap path error: {_e}")
 
